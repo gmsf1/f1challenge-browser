@@ -239,14 +239,105 @@ static void on_error(WGPUDevice const *d, WGPUErrorType t, WGPUStringView msg, v
     if (count++ < 20) fprintf(stderr, "[wgpu] error %d: %.*s\n", (int)t, (int)msg.length, msg.data);
 }
 
+/* ------------------------------------------------------------------ post pass
+ * The back buffer reaches the window through one full-screen pass: FXAA 1.0 (the game has no anti-aliasing, so edges
+ * on the track and car are stair-stepped) and a mild edge-limited sharpen that gives the 2D HUD and text back the
+ * crispness FXAA takes. It also letterboxes (the viewport is the picture's rectangle; the rest stays black).
+ * RC_POST=0 (browser: ?rc_post=0) turns it off and copies the picture as before. */
+static const char WGSL_POST[] =
+"@group(0) @binding(0) var src: texture_2d<f32>;\n"
+"@group(0) @binding(1) var smp: sampler;\n"
+"struct VO { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };\n"
+"@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {\n"
+"  let x = f32((i << 1u) & 2u); let y = f32(i & 2u);\n"
+"  var o: VO; o.uv = vec2<f32>(x, y); o.p = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0); return o;\n"
+"}\n"
+"fn tap(uv: vec2<f32>) -> vec3<f32> { return textureSampleLevel(src, smp, uv, 0.0).rgb; }\n"
+"fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }\n"
+"@fragment fn fs(in: VO) -> @location(0) vec4<f32> {\n"
+"  let px = 1.0 / vec2<f32>(textureDimensions(src));\n"
+"  let m = tap(in.uv);\n"
+"  let nw = tap(in.uv + vec2<f32>(-1.0, -1.0) * px); let ne = tap(in.uv + vec2<f32>(1.0, -1.0) * px);\n"
+"  let sw = tap(in.uv + vec2<f32>(-1.0, 1.0) * px);  let se = tap(in.uv + vec2<f32>(1.0, 1.0) * px);\n"
+"  let lm = luma(m); let lnw = luma(nw); let lne = luma(ne); let lsw = luma(sw); let lse = luma(se);\n"
+"  let lmin = min(lm, min(min(lnw, lne), min(lsw, lse))); let lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));\n"
+"  var col = m;\n"
+"  if (lmax - lmin > max(0.0312, lmax * 0.125)) {\n"            /* an edge: blend along it */
+"    var dir = vec2<f32>(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));\n"
+"    let reduce = max((lnw + lne + lsw + lse) * (0.25 / 8.0), 1.0 / 128.0);\n"
+"    dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), vec2<f32>(-8.0), vec2<f32>(8.0)) * px;\n"
+"    let a = 0.5 * (tap(in.uv + dir * (1.0 / 3.0 - 0.5)) + tap(in.uv + dir * (2.0 / 3.0 - 0.5)));\n"
+"    let b = a * 0.5 + 0.25 * (tap(in.uv + dir * -0.5) + tap(in.uv + dir * 0.5));\n"
+"    let lb = luma(b);\n"
+"    col = select(b, a, lb < lmin || lb > lmax);\n"
+"  }\n"
+"  let n = tap(in.uv + vec2<f32>(0.0, -1.0) * px); let s = tap(in.uv + vec2<f32>(0.0, 1.0) * px);\n"
+"  let e = tap(in.uv + vec2<f32>(1.0, 0.0) * px);  let w = tap(in.uv + vec2<f32>(-1.0, 0.0) * px);\n"
+"  let lo = min(m, min(min(n, s), min(e, w))); let hi = max(m, max(max(n, s), max(e, w)));\n"
+"  col = clamp(col + (col - (n + s + e + w) * 0.25) * 0.25, lo, hi);\n"
+"  return vec4<f32>(col, 1.0);\n"
+"}\n";
+static WGPURenderPipeline g_post_pipe;
+static WGPUBindGroupLayout g_post_bgl;
+static WGPUSampler g_post_smp;
+static WGPUBindGroup g_post_bg;
+
+static void post_rebind(void) {   /* the back buffer was (re)created */
+    if (!g_post_bgl) return;
+    if (g_post_bg) wgpuBindGroupRelease(g_post_bg);
+    WGPUBindGroupEntry be[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+    be[0].binding = 0; be[0].textureView = g_bb_view;
+    be[1].binding = 1; be[1].sampler = g_post_smp;
+    WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bgd.layout = g_post_bgl; bgd.entryCount = 2; bgd.entries = be;
+    g_post_bg = wgpuDeviceCreateBindGroup(g_dev, &bgd);
+}
+
+static void post_create(void) {
+    const char *e = getenv("RC_POST");
+    if (e && *e == '0') return;
+    WGPUShaderSourceWGSL src = WGPU_SHADER_SOURCE_WGSL_INIT;
+    src.code = sv(WGSL_POST);
+    WGPUShaderModuleDescriptor smd = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    smd.nextInChain = &src.chain;
+    WGPUShaderModule mod = wgpuDeviceCreateShaderModule(g_dev, &smd);
+    WGPUBindGroupLayoutEntry le[2] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+    le[0].binding = 0; le[0].visibility = WGPUShaderStage_Fragment;
+    le[0].texture.sampleType = WGPUTextureSampleType_Float; le[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    le[1].binding = 1; le[1].visibility = WGPUShaderStage_Fragment; le[1].sampler.type = WGPUSamplerBindingType_Filtering;
+    WGPUBindGroupLayoutDescriptor bd = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    bd.entryCount = 2; bd.entries = le;
+    g_post_bgl = wgpuDeviceCreateBindGroupLayout(g_dev, &bd);
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &g_post_bgl;
+    WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(g_dev, &pld);
+    WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    sd.magFilter = sd.minFilter = WGPUFilterMode_Linear;
+    sd.addressModeU = sd.addressModeV = WGPUAddressMode_ClampToEdge;
+    g_post_smp = wgpuDeviceCreateSampler(g_dev, &sd);
+    WGPUColorTargetState ct = WGPU_COLOR_TARGET_STATE_INIT;
+    ct.format = g_surf_fmt;
+    WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+    fs.module = mod; fs.entryPoint = sv("fs"); fs.targetCount = 1; fs.targets = &ct;
+    WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    pd.layout = pl;
+    pd.vertex.module = mod; pd.vertex.entryPoint = sv("vs");
+    pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    pd.fragment = &fs;
+    pd.multisample.count = 1; pd.multisample.mask = 0xFFFFFFFFu;
+    g_post_pipe = wgpuDeviceCreateRenderPipeline(g_dev, &pd);
+    post_rebind();
+}
+
 static void make_depth(void) {
     if (g_bb) { release_view(g_bb_view); wgpuTextureRelease(g_bb); }
     WGPUTextureDescriptor bd = WGPU_TEXTURE_DESCRIPTOR_INIT;
     bd.size = (WGPUExtent3D){ (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
     bd.format = g_surf_fmt;
-    bd.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
+    bd.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding;
     g_bb = wgpuDeviceCreateTexture(g_dev, &bd);
     g_bb_view = wgpuTextureCreateView(g_bb, NULL);
+    post_rebind();
     if (g_depth) { release_view(g_depth_view); wgpuTextureRelease(g_depth); }
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
     td.size = (WGPUExtent3D){ (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
@@ -356,6 +447,7 @@ static void create_resources(void) {
     WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bgd.layout = g_bgl_u; bgd.entryCount = 1; bgd.entries = &be;
     g_bg_u = wgpuDeviceCreateBindGroup(g_dev, &bgd);
+    post_create();
     make_solid(&g_white, 255);
     make_solid(&g_black, 0);   /* pixel shaders sampling an empty stage read (0, 0, 0, 1) */
     fprintf(stderr, "[wgpu] renderer ready: rendering at %dx%d in a %dx%d window\n", g_surf_w, g_surf_h, g_win_w, g_win_h);
@@ -496,9 +588,12 @@ static WGPUSampler sampler_for(uint32_t key) {
     WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
     sd.magFilter = mag ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
     sd.minFilter = min ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
-    sd.mipmapFilter = mip == 2 ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
+    /* all-linear with mipmaps: trilinear and 16x anisotropic (sharper road and kerbs at grazing angles, no visible mip
+     * steps), even where the game asked for point-sampled mips; anisotropy needs every filter linear */
+    int smooth = mag && min && mip >= 1 && !getenv("RC_NO_AA_FILTER");
+    sd.mipmapFilter = mip == 2 || smooth ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
     sd.lodMaxClamp = mip ? 32.f : 0.f;
-    if (mag && min && mip == 2) sd.maxAnisotropy = 8;   /* trilinear: anisotropic too (sharper road and kerbs at grazing angles; needs all-linear filters) */
+    if (smooth) sd.maxAnisotropy = 16;
     sd.addressModeU = addr_mode(au);
     sd.addressModeV = addr_mode(av);
     g_samplers[key] = wgpuDeviceCreateSampler(g_dev, &sd);
@@ -1047,7 +1142,24 @@ static void exec_present(const CmdPresent *c) {
     if (cur.status == WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal ||
         cur.status == WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_dev, NULL);
-        if (g_win_w != g_surf_w || g_win_h != g_surf_h) {   /* black bars around the 4:3 picture */
+        if (g_post_pipe && g_post_bg) {   /* FXAA + sharpen, letterboxed by the viewport */
+            WGPUTextureView v = wgpuTextureCreateView(cur.texture, NULL);
+            WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            ca.view = v; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
+            ca.clearValue = (WGPUColor){ 0, 0, 0, 1 };
+            WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            rp.colorAttachmentCount = 1; rp.colorAttachments = &ca;
+            WGPURenderPassEncoder pe = wgpuCommandEncoderBeginRenderPass(enc, &rp);
+            wgpuRenderPassEncoderSetPipeline(pe, g_post_pipe);
+            wgpuRenderPassEncoderSetBindGroup(pe, 0, g_post_bg, 0, NULL);
+            wgpuRenderPassEncoderSetViewport(pe, (float)((g_win_w - g_surf_w) / 2), (float)((g_win_h - g_surf_h) / 2),
+                                             (float)g_surf_w, (float)g_surf_h, 0.f, 1.f);
+            wgpuRenderPassEncoderDraw(pe, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pe);
+            wgpuRenderPassEncoderRelease(pe);
+            wgpuTextureViewRelease(v);
+        } else {
+        if (g_win_w != g_surf_w || g_win_h != g_surf_h) {   /* black bars around the picture */
             WGPUTextureView v = wgpuTextureCreateView(cur.texture, NULL);
             WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
             ca.view = v; ca.loadOp = WGPULoadOp_Clear; ca.storeOp = WGPUStoreOp_Store;
@@ -1065,6 +1177,7 @@ static void exec_present(const CmdPresent *c) {
         dst.origin = (WGPUOrigin3D){ (uint32_t)(g_win_w - g_surf_w) / 2, (uint32_t)(g_win_h - g_surf_h) / 2, 0 };
         WGPUExtent3D ex = { (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
         wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &ex);
+        }
         WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, NULL);
         wgpuQueueSubmit(g_queue, 1, &cb);
         wgpuCommandBufferRelease(cb);
