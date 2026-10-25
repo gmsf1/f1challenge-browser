@@ -588,12 +588,12 @@ static WGPUSampler sampler_for(uint32_t key) {
     WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
     sd.magFilter = mag ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
     sd.minFilter = min ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
-    /* all-linear with mipmaps: trilinear and 16x anisotropic (sharper road and kerbs at grazing angles, no visible mip
-     * steps), even where the game asked for point-sampled mips; anisotropy needs every filter linear */
-    int smooth = mag && min && mip >= 1 && !getenv("RC_NO_AA_FILTER");
-    sd.mipmapFilter = mip == 2 || smooth ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
+    /* Where the game asked for trilinear (all three filters linear): 16x anisotropic (sharper road and kerbs at grazing
+     * angles; it needs every filter linear). Point-sampled mips stay as the game set them: blending in a level the game
+     * never filled in smears the sponsor decals on the cars. */
+    sd.mipmapFilter = mip == 2 ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
     sd.lodMaxClamp = mip ? 32.f : 0.f;
-    if (smooth) sd.maxAnisotropy = 16;
+    if (mag && min && mip == 2) sd.maxAnisotropy = getenv("RC_NO_AA_FILTER") ? 8 : 16;
     sd.addressModeU = addr_mode(au);
     sd.addressModeV = addr_mode(av);
     g_samplers[key] = wgpuDeviceCreateSampler(g_dev, &sd);
