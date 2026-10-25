@@ -1,0 +1,11 @@
+build/
+build_web/
+out_all/
+work/
+.remember/
+.venv/
+__pycache__/
+*.log
+.DS_Store
+.boost/
+.cloudflare/

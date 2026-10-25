@@ -1,0 +1,52 @@
+# Defaults compiled into the game, changed to the player's preferred ones (see translator/x86toc.py --patch-imm/--patch-reg).
+# Generated from the shipped GMS profile; each driving-aid entry has two stores (default and current).
+--patch-reg 0x4aa36c:edi=2   # Steering Help
+--patch-reg 0x4aa379:edi=2   # Steering Help
+--patch-reg 0x4aa3cd:edi=2   # Throttle Control
+--patch-reg 0x4aa3da:edi=2   # Throttle Control
+--patch-reg 0x4aa3f7:edi=0   # Brake Help
+--patch-reg 0x4aa404:edi=0   # Brake Help
+--patch-reg 0x4aa421:edi=2   # Antilock Brakes
+--patch-reg 0x4aa42e:edi=2   # Antilock Brakes
+--patch-reg 0x4aa44b:edi=0   # Spin Recovery
+--patch-reg 0x4aa458:edi=0   # Spin Recovery
+--patch-reg 0x4aa49b:edi=0   # Autopit
+--patch-reg 0x4aa4a4:edi=0   # Autopit
+--patch-reg 0x4aa4e7:edi=2   # Stability Control
+--patch-reg 0x4aa4f4:edi=2   # Stability Control
+# Pitcrew Push: not patched ([])
+# Auto Lift: not patched ([])
+# Auto Blip: not patched ([])
+# Half Rate: not patched ([])
+# Launch Control: not patched ([])
+# Tire Sampling: not patched ([])
+# Telemetry Version: not patched ([])
+# Telemetry Rate: not patched ([])
+# Telemetry In Race: not patched ([])
+--patch-imm 0x4ad446=200   # Control - Accelerate
+--patch-imm 0x4ad459=208   # Control - Brake
+--patch-imm 0x4ad46c=203   # Control - Steer Left
+--patch-imm 0x4ad47f=205   # Control - Steer Right
+--patch-imm 0x4ad492=30   # Control - Shift Up
+--patch-imm 0x4ad4a5=44   # Control - Shift Down
+--patch-imm 0x4ad59f=23   # Control - Pit Menu Up
+--patch-imm 0x4ad5b5=37   # Control - Pit Menu Down
+--patch-imm 0x4ad5cb=36   # Control - Pit Menu Inc
+--patch-imm 0x4ad5e1=38   # Control - Pit Menu Dec
+--patch-imm 0x4ad5f7=46   # Control - TCOverride
+--patch-imm 0x4ad60a=17   # Control - Launch Control
+--patch-imm 0x4ad61d=18   # Control - Speed Limiter
+# The game's own control presets (function 0x4ae750) are applied at session start and replace the player's keys:
+--patch-imm 0x4ae788=205   # preset: Steer Right
+--patch-imm 0x4ae798=203   # preset: Steer Left
+--patch-imm 0x4ae7a8=200   # preset: Accelerate
+--patch-imm 0x4ae7b8=208   # preset: Brake
+--patch-imm 0x4ae7c8=30   # preset: Shift Up
+--patch-imm 0x4ae7d8=44   # preset: Shift Down
+--patch-imm 0x4ae921=18   # preset: Speed Limiter
+--patch-imm 0x4ae961=23   # preset: Pit Menu Up
+--patch-imm 0x4ae971=37   # preset: Pit Menu Down
+--patch-imm 0x4ae981=36   # preset: Pit Menu Inc
+--patch-imm 0x4ae991=38   # preset: Pit Menu Dec
+--patch-imm 0x4ae9d1=46   # preset: TCOverride
+--patch-imm 0x4ae9e1=17   # preset: Launch Control
