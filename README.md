@@ -8,7 +8,8 @@ No game files are included; bring your own copy.
 
 ## Status
 Boots to the front end, loads Test Day and Practice sessions (tested on Albert Park) and renders the track, sky, pit lane and cars in Chrome
-(WebGPU). Mouse and keyboard work in the menus and on track, and the driving keys and aids you set in the game are kept. Audio works through a small Miles
+(WebGPU). Mouse and keyboard work in the menus and on track, and the driving keys and aids you set in the game are kept. A camera button next to the fullscreen button
+cycles the views (the game's own key for that is Home, fn + Left on a Mac). Audio works through a small Miles
 reimplementation (`host/miles.c`: WAV effects, MP3 music via minimp3). The game's own LAN multiplayer works between two browsers (see Multiplayer below).
 Not done: movies (Bink is faked: 1-frame intros, endless menu backdrops) and internet play beyond a relay you run yourself. The game needs about 800 MB of guest heap.
 
@@ -18,6 +19,26 @@ You need a *readable* exe (the retail one is SafeDisc-encrypted; this project do
 `VIDEOGUID=D7B71E3E-4212-11CF-077A-9A2106C2CB35`). Menus: click ✓ on Test Day, pick a circuit, ✓ again, then the drive flag.
 
 Debug: `http://localhost:8007/?autoplay&log` (host log), `&trace` (each game function once), `&d3d=1`, `&fps`, and the `?rc_*` switches below.
+
+## Picture quality
+The renderer adds two things to the game's own picture, both on by default:
+- A post pass at present time: FXAA plus an edge-limited sharpen, with the 640x480 picture letterboxed into the window. Turn it off with `?rc_post=0` (`RC_POST=0` natively).
+- 16x anisotropic filtering, applied only where the game itself asks for trilinear filtering, so decals such as car sponsors stay where they are. `?rc_no_aa_filter=1` lowers it to 8x.
+
+## Texture tools
+Offline tools in `tools/` upscale the textures inside the game's `.mas` archives. They work on a copy of the game folder (each archive is rewritten in place
+and the original is kept next to it as `.orig`), never on your only copy.
+
+- `tools/mas.py list|unpack|pack` reads and writes the `CUBEMAS4.10` archives. `pack --like ORIGINAL` keeps the original's header.
+- `tools/upscale_mas.py ARCHIVE.mas ...` upscales the 24-bit BMP and 24/32-bit TGA textures 2x with Real-ESRGAN (ncnn/Vulkan; put the release binary and models in
+  `work/realesrgan/bin`). The magenta colour key is filled in before the model sees it and put back exactly afterwards, TGA alpha is upscaled when it has detail, and
+  textures with no detail are skipped. Results are cached by content, so a rerun only does new work.
+- Gritty surfaces (tarmac, grass, gravel, foliage, sky) are left alone by default, because the model smooths their grain away. `--grain 1.0` gives them a plain resize plus
+  synthesized grain of the same spectrum (`tools/detail_synth.py`) instead.
+- `tools/sd_enhance.py` is a Stable Diffusion 1.5 plus ControlNet tile pass for experiments. On tarmac it smooths the grain and tiles worse than the grain tool, so the upscaler does not use it.
+
+Example for the 2002 cars (a few minutes; each car's archive grows from about 2 MB to 7-14 MB):
+`uv run --with pillow --with numpy python tools/upscale_mas.py "$GAME"/SeasonData/Vehicles/*/2002_*/TEAM.MAS --grain 1.0`
 
 ## Multiplayer
 `host/winsock.c` implements the game's Winsock calls on a virtual LAN. Players in one room get addresses `10.77.0.<id>`, and UDP broadcast, UDP and TCP
@@ -65,7 +86,7 @@ Headless runs write into the game folder (saves included), so run them on a copy
   the x86-to-C translator, the runtime, the Windows/Direct3D/DirectInput/DirectSound host layer, the WebGPU renderer, the loader and the netplay server.
   This project adapts it to F1 Challenge 99-02.
 - **Manvindar Singh**: the F1 Challenge port (profile, `host/f1c.c`, setjmp/longjmp unwinding, Bink/Winsock/cursor support,
-  input fixes, culling and texture fixes, Miles audio, the LAN bridge and relay, the launcher).
+  input fixes, culling and texture fixes, Miles audio, the LAN bridge and relay, the launcher, the display filters, the texture tools, the driving-aid defaults and the camera button).
 - Built with [Ghidra](https://ghidra-sre.org/) (NSA, Apache-2.0), [Capstone](https://www.capstone-engine.org/) and [Unicorn](https://www.unicorn-engine.org/) (difftest),
   [Emscripten](https://emscripten.org/) with the emdawnwebgpu port (Dawn), wgpu-native for the native build, and [minimp3](https://github.com/lieff/minimp3) (CC0) for the music.
 - *F1 Challenge '99-'02* is (c) Electronic Arts / Image Space Incorporated (ISI). Everyone who made the game: this is a preservation/compatibility project.
@@ -77,4 +98,4 @@ Not affiliated with or endorsed by Electronic Arts, ISI or Microsoft. All tradem
 ## Defaults compiled into the game
 The game builds its settings (driving aids, key bindings) from defaults in its code and doesn't always apply the player file in a session,
 so `host/f1c.patches` changes those defaults at translation time (`translator/x86toc.py --patch-imm/--patch-reg`; run `tools/translate_f1c.sh`, then `build_web.sh`).
-The Difficulty presets (function `0x4adf10`) overwrite the driving aids whenever the profile loads or a level is chosen, so the Beginner and Novice presets are patched too: Braking Point Assistance, Spin Recovery and Pit Lane Assistance start Off.
+The Difficulty presets (function `0x4adf10`) overwrite the driving aids whenever the profile loads or a level is chosen, so the Beginner and Novice presets are patched too. That is why Braking Point Assistance, Spin Recovery and Pit Lane Assistance start Off.
