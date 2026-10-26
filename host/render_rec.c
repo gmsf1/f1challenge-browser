@@ -124,6 +124,57 @@ static int want_screenshot(uint32_t frame) {
 /* ------------------------------------------------------------------ render target tracking */
 
 static CmdTarget g_last_target;   /* zero: back buffer, not yet sent */
+
+/* ------------------------------------------------------------------ screen-space shadows (see CmdShadow)
+ * The game draws the world with a few perspective projections (the cars and the cockpit have their own); the one most depth-writing draws used
+ * is the scene camera. The shadow pass is sent before the first pre-transformed (2D) draw that follows the scene, so the HUD is not shaded. */
+static struct { float view[16], proj[16], light[4]; uint32_t n; } g_pj[4];
+static int g_npj, g_shadow_sent;
+
+volatile int g_rtshadow = -1;   /* -1: not read yet (RC_RTSHADOW); the page's shadow button sets it */
+static int rtshadow_on(void) {
+    if (g_rtshadow < 0) { const char *e = getenv("RC_RTSHADOW"); g_rtshadow = e && *e && *e != '0'; }
+    return g_rtshadow;
+}
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+EMSCRIPTEN_KEEPALIVE void rc_rtshadow(int on) { g_rtshadow = on != 0; }
+#endif
+
+static void scene_note(const DevState *st) {
+    const float *p = st->transform[3];
+    if (fabsf(p[11] - 1.f) > 1e-3f || fabsf(p[15]) > 1e-3f) return;   /* not a perspective projection */
+    int f = -1;
+    for (int i = 0; i < g_npj; i++) if (g_pj[i].proj[10] == p[10] && g_pj[i].proj[14] == p[14] && g_pj[i].proj[0] == p[0]) f = i;
+    if (f < 0) {
+        f = g_npj < 4 ? g_npj++ : 0;
+        for (int i = 0; i < g_npj; i++) if (g_pj[i].n < g_pj[f].n) f = i;
+        g_pj[f].n = 0;
+        memcpy(g_pj[f].proj, p, sizeof g_pj[f].proj);
+    }
+    g_pj[f].n++;
+    memcpy(g_pj[f].view, st->transform[2], sizeof g_pj[f].view);
+    memset(g_pj[f].light, 0, sizeof g_pj[f].light);
+    for (int i = 0; i < 8; i++) {
+        const uint32_t *lt = (const uint32_t *)st->light[i];
+        if (st->light_enabled[i] && lt[0] == 3 /* D3DLIGHT_DIRECTIONAL */) {
+            memcpy(g_pj[f].light, (const float *)st->light[i] + 16, 12);   /* Direction */
+            g_pj[f].light[3] = 1.f;
+            break;
+        }
+    }
+}
+
+static void shadow_before_2d(void) {
+    if (g_shadow_sent || !g_npj) return;
+    int b = 0;
+    for (int i = 1; i < g_npj; i++) if (g_pj[i].n > g_pj[b].n) b = i;
+    if (g_pj[b].n < 50) return;   /* menus and the pit-garage preview draw a few dozen */
+    g_shadow_sent = 1;
+    CmdShadow *c = cmd_alloc(CMD_SHADOW, sizeof *c);
+    memcpy(c->view, g_pj[b].view, sizeof c->view); memcpy(c->proj, g_pj[b].proj, sizeof c->proj); memcpy(c->light, g_pj[b].light, sizeof c->light);
+    cmd_end();
+}
 static int g_target_sent;
 static uint32_t g_tgt_lw, g_tgt_lh;
 
@@ -379,6 +430,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
         if (t && t->type == RT_TEXTURE && !(t->usage & 1)) sync_texture(d, t);
     }
 
+    if (rtshadow_on() && L.pos_type == 0x4 && !g_last_target.color_id) shadow_before_2d();
     CmdDraw *c = cmd_alloc(CMD_DRAW, sizeof *c + (size_t)n * sizeof(CVert));
     CVert *cv = (CVert *)(c + 1);
     c->nverts = n;
@@ -477,6 +529,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
        2 is "cull front" and 3 "cull back": pipeline_for() maps the values as they are */
     { static int nocull = -1; if (nocull < 0) nocull = getenv("RC_NO_CULL") != NULL; if (nocull) k.cull = 1; }   /* debug: show culled faces */
     c->key = k;
+    if (rtshadow_on() && k.zen && k.zwrite && L.pos_type != 0x4 && !g_last_target.color_id) scene_note(st);
     c->vp[0] = (float)st->viewport.x; c->vp[1] = (float)st->viewport.y;
     c->vp[2] = (float)(st->viewport.w ? st->viewport.w : g_tgt_lw);
     c->vp[3] = (float)(st->viewport.h ? st->viewport.h : g_tgt_lh);
@@ -500,6 +553,7 @@ static int rec_init(Device *d) {
 static void rec_present_impl(Device *d) {
     CmdPresent *c = cmd_alloc(CMD_PRESENT, sizeof *c);
     c->frame = d->frame;
+    g_npj = 0; g_shadow_sent = 0;
     c->screenshot = (uint32_t)want_screenshot(d->frame);
     cmd_end();
     cmd_flush(1);

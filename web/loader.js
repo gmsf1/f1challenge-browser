@@ -409,6 +409,11 @@ async function run(session) {
     }],
   });
   const canvas = $('canvas');
+  // the shadow button: screen-space shadows (host/render_rec.c, render_wgpu.c); ?rc_rtshadow=1 starts with them on
+  let shadows = /^(1|true|on)$/i.test(params.get('rc_rtshadow') || '');
+  M._rc_rtshadow(shadows ? 1 : 0);
+  $('shd').classList.toggle('on', shadows);
+  $('shd').onclick = () => { shadows = !shadows; M._rc_rtshadow(shadows ? 1 : 0); $('shd').classList.toggle('on', shadows); $('canvas').focus(); };
   M._rc_gpu_init(canvas.width, canvas.height);
   new ResizeObserver(() => { sizeCanvas(); M._rc_set_canvas_size(canvas.width, canvas.height); }).observe(canvas);
   hookInput(M, !!session);

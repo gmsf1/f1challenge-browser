@@ -29,7 +29,7 @@ typedef struct {
 typedef struct PKey { uint32_t blend, src, dst, op, zen, zwrite, zfunc, cull, cmask, topo, ps; } PKey;
 
 enum { CMD_TARGET = 1, CMD_CLEAR, CMD_DRAW, CMD_UPLOAD_TEX, CMD_DESTROY_TEX, CMD_UPLOAD_SURF, CMD_DESTROY_SURF,
-       CMD_READBACK, CMD_PRESENT };
+       CMD_READBACK, CMD_PRESENT, CMD_SHADOW };
 
 typedef struct { uint32_t type, size; } CmdHdr;   /* size includes the header; 8-byte aligned */
 
@@ -70,6 +70,11 @@ typedef struct { CmdHdr h; uint32_t id, w, h_; } CmdUploadSurf;
 typedef struct { CmdHdr h; uint32_t id, w, h_, fmt, pitch, guest_mem; uint64_t done_ptr; } CmdReadback;
 
 typedef struct { CmdHdr h; uint32_t frame, screenshot; } CmdPresent;
+
+/* Screen-space shadows (RC_RTSHADOW): sent once a frame, when the 3D scene is complete and the 2D HUD is about to be drawn. view and proj are the
+   scene camera's Direct3D matrices; light is the direction the first enabled directional light travels in (world space) and light[3] is 1 if the
+   game has one. The executor darkens the back buffer where a ray from the surface toward the light hits something in the depth buffer. */
+typedef struct { CmdHdr h; float view[16], proj[16], light[4]; } CmdShadow;
 
 /* executor entry points */
 void gpu_exec(const CmdHdr *c);              /* native: run one command now */

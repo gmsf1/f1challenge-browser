@@ -24,6 +24,10 @@ Debug: `http://localhost:8007/?autoplay&log` (host log), `&trace` (each game fun
 The renderer adds two things to the game's own picture, both on by default:
 - A post pass at present time: FXAA plus an edge-limited sharpen, with the 640x480 picture letterboxed into the window. Turn it off with `?rc_post=0` (`RC_POST=0` natively).
 - 16x anisotropic filtering, applied only where the game itself asks for trilinear filtering, so decals such as car sponsors stay where they are. `?rc_no_aa_filter=1` lowers it to 8x.
+- Screen-space shadows (experimental, off by default): a sun button next to the camera button, or `?rc_rtshadow=1`. A pass between the 3D scene and the HUD marches a short ray
+  from every surface toward the sun through the depth buffer and darkens the pixel when something in front of it blocks the ray, which gives the cars, pit crew and walls soft
+  shadows on the tarmac. It only sees what is on screen, and the sun is the game's first directional light or, failing that, a fixed high one. Tune with `?rc_rtshadow_strength=0.55`,
+  `_dist=4` (metres), `_thick=1.5` and `_steps=16`. It costs about 20% of the frame rate at 2448x1836 (120 down to about 98 game frames a second in the pit lane).
 
 ## Texture tools
 Offline tools in `tools/` upscale the textures inside the game's `.mas` archives. They work on a copy of the game folder (each archive is rewritten in place
@@ -32,9 +36,11 @@ and the original is kept next to it as `.orig`), never on your only copy.
 - `tools/mas.py list|unpack|pack` reads and writes the `CUBEMAS4.10` archives. `pack --like ORIGINAL` keeps the original's header.
 - `tools/upscale_mas.py ARCHIVE.mas ...` upscales the 24-bit BMP and 24/32-bit TGA textures 2x with Real-ESRGAN (ncnn/Vulkan; put the release binary and models in
   `work/realesrgan/bin`). The magenta colour key is filled in before the model sees it and put back exactly afterwards, TGA alpha is upscaled when it has detail, and
-  textures with no detail are skipped. Results are cached by content, so a rerun only does new work.
+  textures with no detail are skipped. Results are cached by content, so a rerun only does new work. The game holds every texture in its 1.5 GB heap, so a texture whose
+  upscaled size would pass 1024x1024 pixels (`--max-out`) is cleaned up by the model at its own size instead: with the 1024x1024 liveries doubled, a race with a full grid ran out of memory.
 - Gritty surfaces (tarmac, grass, gravel, foliage, sky) are left alone by default, because the model smooths their grain away. `--grain 1.0` gives them a plain resize plus
-  synthesized grain of the same spectrum (`tools/detail_synth.py`) instead.
+  synthesized grain of the same spectrum (`tools/detail_synth.py`) instead. That doubles the pixels of every ground texture, so on a whole track (A1-Ring) it needed more
+  than 1.5 GB of heap; use it on a few textures, with `--skip` or `--max-px` limiting the rest.
 - `tools/sd_enhance.py` is a Stable Diffusion 1.5 plus ControlNet tile pass for experiments. On tarmac it smooths the grain and tiles worse than the grain tool, so the upscaler does not use it.
 
 Example for the 2002 cars (a few minutes; each car's archive grows from about 2 MB to 7-14 MB):

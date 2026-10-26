@@ -173,7 +173,7 @@ static WGPUTextureFormat g_surf_fmt;
 static int g_surf_w, g_surf_h;   /* back buffer: the largest 4:3 area that fits the window */
 static int g_win_w, g_win_h;     /* window (swap chain) size; the back buffer is centred in it */
 static WGPUTexture g_depth;
-static WGPUTextureView g_depth_view;
+static WGPUTextureView g_depth_view, g_depth_sample;   /* g_depth_sample: depth aspect only, for the shadow pass */
 static WGPUTexture g_bb;          /* offscreen back buffer: always rendered, copied to the window when visible */
 static WGPUTextureView g_bb_view;
 static WGPUShaderModule g_shader;   /* shared header + fixed-function fragment stage */
@@ -329,6 +329,148 @@ static void post_create(void) {
     post_rebind();
 }
 
+/* ------------------------------------------------------------------ screen-space shadows
+ * RC_RTSHADOW=1 (browser: ?rc_rtshadow=1, or the page's shadow button) turns it on. Once a frame, between the 3D scene and the HUD (CMD_SHADOW), the back buffer is copied and redrawn
+ * darker where a short ray from the surface toward the sun, marched through the depth buffer, passes behind something that is in front of it.
+ * It only knows what is on screen, so a car just outside the picture casts nothing. RC_RTSHADOW_STRENGTH (0.55), _DIST (metres, 4),
+ * _THICK (metres a blocker may be deeper than the ray before it is ignored, 1.5) and _STEPS (16) tune it. */
+static const char WGSL_RTS[] =
+"struct U { p: vec4<f32>, l: vec4<f32>, q: vec4<f32> };\n"   /* p: m00 m11 m22 m32; l: toward the sun (view space), strength; q: dist thick steps */
+"@group(0) @binding(0) var src: texture_2d<f32>;\n"
+"@group(0) @binding(1) var dep: texture_depth_2d;\n"
+"@group(0) @binding(2) var<uniform> u: U;\n"
+"struct VO { @builtin(position) p: vec4<f32> };\n"
+"@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {\n"
+"  let x = f32((i << 1u) & 2u); let y = f32(i & 2u);\n"
+"  var o: VO; o.p = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0); return o;\n"
+"}\n"
+"fn zview(d: f32) -> f32 { return u.p.w / (d - u.p.z); }\n"
+"fn ign(p: vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }\n"
+"@fragment fn fs(in: VO) -> @location(0) vec4<f32> {\n"
+"  let ip = vec2<i32>(in.p.xy);\n"
+"  let col = textureLoad(src, ip, 0);\n"
+"  let d = textureLoad(dep, ip, 0);\n"
+"  if (d >= 0.99999) { return col; }\n"                            /* sky */
+"  let dims = vec2<f32>(textureDimensions(src));\n"
+"  let z = zview(d);\n"
+"  let ndc = vec2<f32>(in.p.x / dims.x * 2.0 - 1.0, 1.0 - in.p.y / dims.y * 2.0);\n"
+"  let P = vec3<f32>(ndc.x * z / u.p.x, ndc.y * z / u.p.y, z);\n"
+"  let n = i32(u.q.z);\n"
+"  let jit = ign(in.p.xy);\n"
+"  var occ = 0.0;\n"
+"  for (var i = 0; i < n; i = i + 1) {\n"
+"    let f = (f32(i) + jit) / f32(n);\n"
+"    let t = 0.04 + u.q.x * f * f;\n"                                /* more samples near the surface */
+"    let s = P + u.l.xyz * t;\n"
+"    if (s.z <= 0.05) { break; }\n"
+"    let sn = vec2<f32>(s.x * u.p.x / s.z, s.y * u.p.y / s.z);\n"
+"    let suv = vec2<f32>(sn.x * 0.5 + 0.5, 0.5 - sn.y * 0.5);\n"
+"    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { break; }\n"
+"    let sd = textureLoad(dep, vec2<i32>(suv * dims), 0);\n"
+"    if (sd >= 0.99999) { continue; }\n"
+"    let diff = s.z - zview(sd);\n"                                   /* > 0: the scene is in front of the ray here */
+"    if (diff > 0.03 + 0.012 * z && diff < u.q.y) { occ = max(occ, 1.0 - 0.5 * t / u.q.x); }\n"
+"  }\n"
+"  return vec4<f32>(col.rgb * (1.0 - u.l.w * occ), col.a);\n"
+"}\n";
+static WGPURenderPipeline g_rts_pipe;
+static WGPUBindGroupLayout g_rts_bgl;
+static WGPUBindGroup g_rts_bg;
+static WGPUTexture g_rts_tmp;
+static WGPUTextureView g_rts_tmp_view;
+static WGPUBuffer g_rts_ubuf;
+static float g_rts_strength = 0.55f, g_rts_dist = 4.f, g_rts_thick = 1.5f, g_rts_steps = 16.f;
+
+static WGPUTextureView g_rts_dv;   /* the depth view the bind group points at */
+static void rts_forget_view(WGPUTextureView dv);
+static struct { WGPUTexture t; WGPUTextureView v; } g_dviews[8];   /* depth-aspect views of the depth textures the scene has used */
+
+static WGPUTextureView depth_only_view(WGPUTexture t) {
+    int free_slot = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_dviews[i].t == t) return g_dviews[i].v;
+        if (!g_dviews[i].t && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) free_slot = 0;
+    if (g_dviews[free_slot].t) { rts_forget_view(g_dviews[free_slot].v); release_view(g_dviews[free_slot].v); }
+    WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+    vd.aspect = WGPUTextureAspect_DepthOnly;
+    g_dviews[free_slot].t = t; g_dviews[free_slot].v = wgpuTextureCreateView(t, &vd);
+    return g_dviews[free_slot].v;
+}
+
+static void rts_bind(WGPUTextureView dv) {
+    if (g_rts_bg) wgpuBindGroupRelease(g_rts_bg);
+    WGPUBindGroupEntry be[3] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+    be[0].binding = 0; be[0].textureView = g_rts_tmp_view;
+    be[1].binding = 1; be[1].textureView = dv;
+    be[2].binding = 2; be[2].buffer = g_rts_ubuf; be[2].size = 48;
+    WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bgd.layout = g_rts_bgl; bgd.entryCount = 3; bgd.entries = be;
+    g_rts_bg = wgpuDeviceCreateBindGroup(g_dev, &bgd);
+    g_rts_dv = dv;
+}
+
+static void rts_forget_view(WGPUTextureView dv) {
+    if (g_rts_dv == dv) { if (g_rts_bg) wgpuBindGroupRelease(g_rts_bg); g_rts_bg = NULL; g_rts_dv = NULL; }
+}
+
+static void rts_forget(WGPUTexture t) {   /* a depth surface is being destroyed */
+    for (int i = 0; i < 8; i++)
+        if (g_dviews[i].t == t) { rts_forget_view(g_dviews[i].v); release_view(g_dviews[i].v); g_dviews[i].t = NULL; g_dviews[i].v = NULL; }
+}
+
+static void rts_rebind(void) {   /* the back buffer and depth buffer were (re)created */
+    if (!g_rts_bgl) return;
+    if (g_rts_tmp) { release_view(g_rts_tmp_view); wgpuTextureRelease(g_rts_tmp); }
+    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    td.size = (WGPUExtent3D){ (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
+    td.format = g_surf_fmt;
+    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    g_rts_tmp = wgpuDeviceCreateTexture(g_dev, &td);
+    g_rts_tmp_view = wgpuTextureCreateView(g_rts_tmp, NULL);
+    rts_bind(g_depth_sample);
+}
+
+static float envf(const char *name, float def) { const char *e = getenv(name); return e && *e ? (float)atof(e) : def; }
+
+static void rts_create(void) {
+    g_rts_strength = envf("RC_RTSHADOW_STRENGTH", g_rts_strength); g_rts_dist = envf("RC_RTSHADOW_DIST", g_rts_dist);
+    g_rts_thick = envf("RC_RTSHADOW_THICK", g_rts_thick); g_rts_steps = envf("RC_RTSHADOW_STEPS", g_rts_steps);
+    WGPUShaderSourceWGSL src = WGPU_SHADER_SOURCE_WGSL_INIT;
+    src.code = sv(WGSL_RTS);
+    WGPUShaderModuleDescriptor smd = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    smd.nextInChain = &src.chain;
+    WGPUShaderModule mod = wgpuDeviceCreateShaderModule(g_dev, &smd);
+    WGPUBindGroupLayoutEntry le[3] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+    le[0].binding = 0; le[0].visibility = WGPUShaderStage_Fragment;
+    le[0].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat; le[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    le[1].binding = 1; le[1].visibility = WGPUShaderStage_Fragment;
+    le[1].texture.sampleType = WGPUTextureSampleType_Depth; le[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    le[2].binding = 2; le[2].visibility = WGPUShaderStage_Fragment; le[2].buffer.type = WGPUBufferBindingType_Uniform;
+    WGPUBindGroupLayoutDescriptor bd = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    bd.entryCount = 3; bd.entries = le;
+    g_rts_bgl = wgpuDeviceCreateBindGroupLayout(g_dev, &bd);
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &g_rts_bgl;
+    WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(g_dev, &pld);
+    WGPUBufferDescriptor ubd = WGPU_BUFFER_DESCRIPTOR_INIT;
+    ubd.size = 48; ubd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    g_rts_ubuf = wgpuDeviceCreateBuffer(g_dev, &ubd);
+    WGPUColorTargetState ct = WGPU_COLOR_TARGET_STATE_INIT;
+    ct.format = g_surf_fmt;
+    WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+    fs.module = mod; fs.entryPoint = sv("fs"); fs.targetCount = 1; fs.targets = &ct;
+    WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    pd.layout = pl;
+    pd.vertex.module = mod; pd.vertex.entryPoint = sv("vs");
+    pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    pd.fragment = &fs;
+    pd.multisample.count = 1; pd.multisample.mask = 0xFFFFFFFFu;
+    g_rts_pipe = wgpuDeviceCreateRenderPipeline(g_dev, &pd);
+    rts_rebind();
+}
+
 static void make_depth(void) {
     if (g_bb) { release_view(g_bb_view); wgpuTextureRelease(g_bb); }
     WGPUTextureDescriptor bd = WGPU_TEXTURE_DESCRIPTOR_INIT;
@@ -342,9 +484,14 @@ static void make_depth(void) {
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
     td.size = (WGPUExtent3D){ (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
     td.format = WGPUTextureFormat_Depth24PlusStencil8;
-    td.usage = WGPUTextureUsage_RenderAttachment;
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
     g_depth = wgpuDeviceCreateTexture(g_dev, &td);
     g_depth_view = wgpuTextureCreateView(g_depth, NULL);
+    WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+    vd.aspect = WGPUTextureAspect_DepthOnly;
+    if (g_depth_sample) release_view(g_depth_sample);
+    g_depth_sample = wgpuTextureCreateView(g_depth, &vd);
+    rts_rebind();
 }
 
 static void configure_surface(void) {
@@ -448,6 +595,7 @@ static void create_resources(void) {
     bgd.layout = g_bgl_u; bgd.entryCount = 1; bgd.entries = &be;
     g_bg_u = wgpuDeviceCreateBindGroup(g_dev, &bgd);
     post_create();
+    rts_create();
     make_solid(&g_white, 255);
     make_solid(&g_black, 0);   /* pixel shaders sampling an empty stage read (0, 0, 0, 1) */
     fprintf(stderr, "[wgpu] renderer ready: rendering at %dx%d in a %dx%d window\n", g_surf_w, g_surf_h, g_win_w, g_win_h);
@@ -717,6 +865,7 @@ static WGPURenderPipeline pipeline_for(const PKey *k) {
 static WGPUTextureView g_tgt_color, g_tgt_depth;   /* attachments of the current pass target (NULL: back buffer) */
 static uint32_t g_tgt_w, g_tgt_h, g_tgt_lw = 640, g_tgt_lh = 480;   /* GPU size and Direct3D size */
 static GSurf *g_tgt_gs;                                 /* NULL when drawing to the back buffer */
+static WGPUTexture g_tgt_dtex;                          /* the texture behind the target's depth view (NULL: the device's own, g_depth) */
 
 static void end_pass(void) {
     if (g_pass) { wgpuRenderPassEncoderEnd(g_pass); wgpuRenderPassEncoderRelease(g_pass); g_pass = NULL; }
@@ -825,8 +974,8 @@ static GSurf *gsurf(uint32_t id, uint32_t w, uint32_t h, int depth) {
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
     td.size = (WGPUExtent3D){ g->w, g->h, 1 };
     td.format = depth ? WGPUTextureFormat_Depth24PlusStencil8 : g_surf_fmt;
-    td.usage = WGPUTextureUsage_RenderAttachment |
-               (depth ? 0 : WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst);
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding |
+               (depth ? 0 : WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst);
     g->tex = wgpuDeviceCreateTexture(g_dev, &td);
     g->view = wgpuTextureCreateView(g->tex, NULL);
     obj_put(id, g);
@@ -834,45 +983,50 @@ static GSurf *gsurf(uint32_t id, uint32_t w, uint32_t h, int depth) {
 }
 
 /* depth buffer for targets whose depth surface doesn't match their size (WebGPU needs equal sizes) */
+static WGPUTexture g_scratch_tex;   /* the texture behind the view scratch_depth() returned last */
 static WGPUTextureView scratch_depth(uint32_t w, uint32_t h) {
     static struct { uint32_t w, h; WGPUTexture t; WGPUTextureView v; } cache[8];
-    for (int i = 0; i < 8; i++) if (cache[i].t && cache[i].w == w && cache[i].h == h) return cache[i].v;
+    for (int i = 0; i < 8; i++) if (cache[i].t && cache[i].w == w && cache[i].h == h) { g_scratch_tex = cache[i].t; return cache[i].v; }
     for (int i = 0; i < 8; i++)
         if (!cache[i].t) {
             WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
             td.size = (WGPUExtent3D){ w, h, 1 };
             td.format = WGPUTextureFormat_Depth24PlusStencil8;
-            td.usage = WGPUTextureUsage_RenderAttachment;
+            td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
             cache[i].t = wgpuDeviceCreateTexture(g_dev, &td);
             cache[i].v = wgpuTextureCreateView(cache[i].t, NULL);
             cache[i].w = w; cache[i].h = h;
+            g_scratch_tex = cache[i].t;
             return cache[i].v;
         }
+    g_scratch_tex = cache[0].t;
     return cache[0].v;
 }
 
 static void exec_target(const CmdTarget *c) {
     WGPUTextureView color, depth;
     GSurf *gs = NULL;
+    WGPUTexture dtex = NULL;
     uint32_t w, h;
     if (c->color_id) { gs = gsurf(c->color_id, c->color_w, c->color_h, 0); color = gs->view; w = gs->w; h = gs->h; }
     else { color = g_bb_view; w = (uint32_t)g_surf_w; h = (uint32_t)g_surf_h; }
     if (!c->color_id && !c->depth_id) depth = g_depth_view;
     else if (c->depth_id) {
         GSurf *gd = gsurf(c->depth_id, c->depth_w, c->depth_h, 1);
-        depth = gd->w == w && gd->h == h ? gd->view : scratch_depth(w, h);
-    } else depth = scratch_depth(w, h);
+        if (gd->w == w && gd->h == h) { depth = gd->view; dtex = gd->tex; }
+        else { depth = scratch_depth(w, h); dtex = g_scratch_tex; }
+    } else { depth = scratch_depth(w, h); dtex = g_scratch_tex; }
     if (color != (g_tgt_color ? g_tgt_color : g_bb_view) || depth != (g_tgt_depth ? g_tgt_depth : g_depth_view)) {
         end_pass();
         g_tgt_color = color; g_tgt_depth = depth;
     }
-    g_tgt_w = w; g_tgt_h = h; g_tgt_lw = c->lw; g_tgt_lh = c->lh; g_tgt_gs = gs;
+    g_tgt_w = w; g_tgt_h = h; g_tgt_lw = c->lw; g_tgt_lh = c->lh; g_tgt_gs = gs; g_tgt_dtex = dtex;
 }
 
 static void use_backbuffer(void) {
     if (g_tgt_color && g_tgt_color != g_bb_view) end_pass();
     g_tgt_color = g_tgt_depth = NULL;
-    g_tgt_gs = NULL;
+    g_tgt_gs = NULL; g_tgt_dtex = NULL;
     g_tgt_w = (uint32_t)g_surf_w; g_tgt_h = (uint32_t)g_surf_h;
 }
 
@@ -994,6 +1148,7 @@ static void exec_destroy(uint32_t id, int surface) {
     if (surface) {
         GSurf *g = p;
         if (g->view == g_tgt_color || g->view == g_tgt_depth) use_backbuffer();
+        rts_forget(g->tex);
         release_view(g->view); retire_texture(g->tex);
     } else {
         GTex *g = p;
@@ -1125,6 +1280,41 @@ static void pace_60hz(void) {
 }
 #endif
 
+/* CMD_SHADOW: darken the back buffer behind the 3D scene, before the HUD is drawn over it */
+static void exec_shadow(const CmdShadow *c) {
+    if (!g_rts_pipe || !g_rts_bgl || (g_tgt_color && g_tgt_color != g_bb_view)) return;
+    /* the scene's depth: whatever depth texture the back buffer is being drawn with */
+    WGPUTextureView dv = g_tgt_dtex ? depth_only_view(g_tgt_dtex) : g_depth_sample;
+    if (dv != g_rts_dv || !g_rts_bg) rts_bind(dv);
+    end_pass();
+    if (!g_enc) g_enc = wgpuDeviceCreateCommandEncoder(g_dev, NULL);
+    /* the toward-the-sun direction in view space (Direct3D row vectors: v' = v * M). Without a light from the game: a fixed high sun. */
+    const float *V = c->view;
+    float L[3] = { -0.45f, 0.80f, -0.40f };
+    if (c->light[3] != 0.f) { L[0] = -c->light[0]; L[1] = -c->light[1]; L[2] = -c->light[2]; }
+    float lv[3] = { L[0] * V[0] + L[1] * V[4] + L[2] * V[8], L[0] * V[1] + L[1] * V[5] + L[2] * V[9], L[0] * V[2] + L[1] * V[6] + L[2] * V[10] };
+    float len = sqrtf(lv[0] * lv[0] + lv[1] * lv[1] + lv[2] * lv[2]);
+    if (len < 1e-6f) return;
+    float u[12] = { c->proj[0], c->proj[5], c->proj[10], c->proj[14],
+                    lv[0] / len, lv[1] / len, lv[2] / len, g_rts_strength,
+                    g_rts_dist, g_rts_thick, g_rts_steps, 0.f };
+    wgpuQueueWriteBuffer(g_queue, g_rts_ubuf, 0, u, sizeof u);
+    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    src.texture = g_bb; dst.texture = g_rts_tmp;
+    WGPUExtent3D ex = { (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
+    wgpuCommandEncoderCopyTextureToTexture(g_enc, &src, &dst, &ex);
+    WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    ca.view = g_bb_view; ca.loadOp = WGPULoadOp_Load; ca.storeOp = WGPUStoreOp_Store;
+    WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    rp.colorAttachmentCount = 1; rp.colorAttachments = &ca;
+    WGPURenderPassEncoder pe = wgpuCommandEncoderBeginRenderPass(g_enc, &rp);
+    wgpuRenderPassEncoderSetPipeline(pe, g_rts_pipe);
+    wgpuRenderPassEncoderSetBindGroup(pe, 0, g_rts_bg, 0, NULL);
+    wgpuRenderPassEncoderDraw(pe, 3, 1, 0, 0);
+    wgpuRenderPassEncoderEnd(pe);
+    wgpuRenderPassEncoderRelease(pe);
+}
+
 static void exec_present(const CmdPresent *c) {
     begin_frame();
     use_backbuffer();
@@ -1214,6 +1404,7 @@ void gpu_exec(const CmdHdr *h) {
     case CMD_UPLOAD_SURF: exec_upload_surf((const CmdUploadSurf *)h); break;
     case CMD_DESTROY_SURF: exec_destroy(((const CmdDestroy *)h)->id, 1); break;
     case CMD_PRESENT: exec_present((const CmdPresent *)h); break;
+    case CMD_SHADOW: exec_shadow((const CmdShadow *)h); break;
     case CMD_READBACK: {
         const CmdReadback *c = (const CmdReadback *)h;
         uint32_t gw, gh, stride;
@@ -1290,6 +1481,7 @@ static int run_chunk(Chunk *ch) {
         case CMD_UPLOAD_SURF: exec_upload_surf((const CmdUploadSurf *)h); break;
         case CMD_DESTROY_SURF: exec_destroy(((const CmdDestroy *)h)->id, 1); break;
         case CMD_PRESENT: exec_present((const CmdPresent *)h); break;
+        case CMD_SHADOW: exec_shadow((const CmdShadow *)h); break;
         case CMD_READBACK: {
             const CmdReadback *c = (const CmdReadback *)h;
             WGPUBuffer buf = start_readback(c, &g_rb_gw, &g_rb_gh, &g_rb_stride);
