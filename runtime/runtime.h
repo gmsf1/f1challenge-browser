@@ -16,11 +16,14 @@ extern char g_trap_msg[256];
 #define GUEST_HEAP_BASE        0x10000000u
 /* Natively the guest gets a full 4 GiB reservation. In the browser (wasm32) it must share a 4 GiB
    memory with everything else, so the heap and VirtualAlloc ranges are compacted: Cricket peaked at
-   ~125 MB of heap; F1 track loading needs more (no coalescing in heap_alloc), hence 512 MB of heap and ~580 MB of virtual allocations (mostly mapped archives). */
+   ~125 MB of heap; F1 track loading needs more (no coalescing in heap_alloc), hence 1 GB of heap and 768 MB of virtual allocations (mostly mapped archives).
+   The upscaled textures of tools/upscale_mas.py are four times the pixels (the 2002 cars, tracks with --grain) and the archives are read into the
+   heap rather than mapped (virtual allocations stay near 0 MB in the sessions tried): 1.5 GB of heap and 256 MB of virtual allocations. Guest pointers
+   stay below 0x80000000, as the game compares some of them as signed. */
 #ifdef __EMSCRIPTEN__
-#define GUEST_SPACE            0x90000000ull
-#define GUEST_HEAP_HI          0x50000000u
-#define GUEST_VALLOC_LO        0x50000000u
+#define GUEST_SPACE            0x80000000ull
+#define GUEST_HEAP_HI          0x70000000u
+#define GUEST_VALLOC_LO        0x70000000u
 #define GUEST_VALLOC_HI        0x80000000u
 #else
 #define GUEST_SPACE            0x100000000ull

@@ -409,6 +409,11 @@ async function run(session) {
     }],
   });
   const canvas = $('canvas');
+  // the shadow button: screen-space shadows (host/render_rec.c, render_wgpu.c); ?rc_rtshadow=1 starts with them on
+  let shadows = /^(1|true|on)$/i.test(params.get('rc_rtshadow') || '');
+  M._rc_rtshadow(shadows ? 1 : 0);
+  $('shd').classList.toggle('on', shadows);
+  $('shd').onclick = () => { shadows = !shadows; M._rc_rtshadow(shadows ? 1 : 0); $('shd').classList.toggle('on', shadows); $('canvas').focus(); };
   M._rc_gpu_init(canvas.width, canvas.height);
   new ResizeObserver(() => { sizeCanvas(); M._rc_set_canvas_size(canvas.width, canvas.height); }).observe(canvas);
   hookInput(M, !!session);
@@ -541,6 +546,12 @@ function setupFullscreen() {
   const toggle = () => {
     if (active()) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
     else (stage.requestFullscreen || stage.webkitRequestFullscreen).call(stage)?.catch?.(() => {});
+    $('canvas').focus();
+  };
+  // the game cycles its camera on Home (fn + Left on a Mac keyboard); the button taps that key
+  $('cam').onclick = () => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Home' }));
+    setTimeout(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'Home' })), 80);   // a tap shorter than a frame is missed
     $('canvas').focus();
   };
   if (!stage.requestFullscreen && !stage.webkitRequestFullscreen) { $('fs').classList.add('hidden'); return; }
