@@ -2,7 +2,7 @@
 """AI-upscale the 24-bit BMP and 24/32-bit TGA textures inside .mas archives of a COPY of the game folder (Real-ESRGAN, ncnn/Vulkan).
 
   uv run --with pillow --with numpy python tools/upscale_mas.py ARCHIVE.mas [ARCHIVE.mas ...]
-         [--scale 2] [--model realesrgan-x4plus] [--min 32] [--max-px 1048576] [--skip REGEX] [--method lanczos] [--grain 1.0]
+         [--scale 2] [--model realesrgan-x4plus] [--min 32] [--max-px 1048576] [--skip REGEX] [--method lanczos] [--grain 1.0] [--max-out 1048576]
 
 Each archive is rewritten in place (ARCHIVE.mas.orig keeps the original; rerunning starts from it, so a run can be
 repeated with other settings). Results are cached by the content of each texture. Never point this at your only copy
@@ -100,12 +100,20 @@ def run_model(indir, outdir, a):
                    cwd=BIN, check=True, capture_output=True)
 
 
+def scale_for(img, a):
+    """The scale this texture gets: --scale, or 1 when that would make it larger than --max-out pixels (the game holds every texture
+    in memory, and a grid of upscaled 1024x1024 liveries does not fit; at scale 1 the model still cleans the texture up)."""
+    return a.scale if img.width * img.height * a.scale ** 2 <= a.max_out else 1
+
+
 def grain(raw, name, kind, img, a):
     """Organic texture -> Lanczos `scale`x plus synthesized grain (tools/detail_synth.py); cached, key and alpha handled."""
-    cached = os.path.join(a.cache, hashlib.sha1(raw + f"|grain{a.grain}|{a.scale}".encode()).hexdigest() + "." + kind)
+    sc, (w, h) = scale_for(img, a), img.size
+    if sc == 1:
+        return raw
+    cached = os.path.join(a.cache, hashlib.sha1(raw + f"|grain{a.grain}|{sc}".encode()).hexdigest() + "." + kind)
     if os.path.exists(cached):
         return open(cached, "rb").read()
-    sc, (w, h) = a.scale, img.size
     km = key_mask(img) if kind == "bmp" else None
     has_key = km is not None and km.mean() > 0.002
     base = fill_key(img, km) if has_key else img.convert("RGB")
@@ -126,9 +134,8 @@ def process(path, a):
         shutil.copy2(path, orig)
     d, base, ents = M.read(orig)
     os.makedirs(a.cache, exist_ok=True)
-    sc = a.scale
-    h = lambda raw, extra="": hashlib.sha1(raw + f"|{a.model}|{sc}|{a.method}|{TAG}|{extra}".encode()).hexdigest()
-    files, jobs, need = {}, [], {}   # need: cache key -> (padded PIL image to feed the model, pad)
+    h = lambda raw, sc, extra="": hashlib.sha1(raw + f"|{a.model}|{sc}|{a.method}|{TAG}|{extra}".encode()).hexdigest()
+    files, jobs, need = {}, [], {}   # need: cache key -> (padded PIL image to feed the model, pad, scale)
     for e in ents:
         raw = M.blob(d, base, e)
         files[e["name"]] = raw
@@ -149,33 +156,34 @@ def process(path, a):
         alpha_busy = alpha is not None and detail(np.asarray(alpha)) > 0.1
         if not colour_busy and not alpha_busy:
             continue
-        k = h(raw)
+        sc = scale_for(img, a)
+        k = h(raw, sc)
         cached = os.path.join(a.cache, k + "." + kind)
         if os.path.exists(cached):
             files[e["name"]] = open(cached, "rb").read()
             continue
         pad = min(16, img.width // 2, img.height // 2)
-        job = dict(name=e["name"], k=k, kind=kind, img=img, pad=pad, km=km if has_key else None, ka=None)
-        need[k] = (wrap_pad(fill_key(img, km) if has_key else img.convert("RGB"), pad), pad)
+        job = dict(name=e["name"], k=k, kind=kind, img=img, pad=pad, sc=sc, km=km if has_key else None, ka=None)
+        need[k] = (wrap_pad(fill_key(img, km) if has_key else img.convert("RGB"), pad), pad, sc)
         if alpha_busy:
             job["ka"] = k + "a"
-            need[job["ka"]] = (wrap_pad(Image.merge("RGB", (alpha, alpha, alpha)), pad), pad)
+            need[job["ka"]] = (wrap_pad(Image.merge("RGB", (alpha, alpha, alpha)), pad), pad, sc)
         jobs.append(job)
     results = {}   # key -> upscaled padded image
     if a.method == "lanczos":
-        for k, (im, pad) in need.items():
+        for k, (im, pad, sc) in need.items():
             results[k] = im.resize((im.width * sc, im.height * sc), Image.LANCZOS)
     elif need:
         with tempfile.TemporaryDirectory() as t:
             ind, outd = os.path.join(t, "in"), os.path.join(t, "out")
             os.makedirs(ind), os.makedirs(outd)
-            for k, (im, pad) in need.items():
+            for k, (im, pad, sc) in need.items():
                 im.save(os.path.join(ind, k + ".png"))
             run_model(ind, outd, a)
-            for k, (im, pad) in need.items():
+            for k, (im, pad, sc) in need.items():
                 results[k] = Image.open(os.path.join(outd, k + ".png")).convert("RGB")
     for j in jobs:
-        w, hh, pad = j["img"].width, j["img"].height, j["pad"]
+        w, hh, pad, sc = j["img"].width, j["img"].height, j["pad"], j["sc"]
         full = ((w + 2 * pad) * sc, (hh + 2 * pad) * sc)
         crop = (pad * sc, pad * sc, (pad + w) * sc, (pad + hh) * sc)
 
@@ -209,6 +217,7 @@ def main():
     ap.add_argument("--skip", default=ORGANIC, help="regex of texture names to leave alone")
     ap.add_argument("--grain", type=float, default=0, metavar="STRENGTH", help="give the --skip (organic) textures a Lanczos resize plus synthesized grain of this strength (try 1.0) instead of leaving them alone")
     ap.add_argument("--min", type=int, default=32, help="skip textures smaller than this (either side)")
+    ap.add_argument("--max-out", type=int, default=1 << 20, help="a texture whose upscaled size would exceed this many pixels (1024x1024 by default) is cleaned up at its own size instead")
     ap.add_argument("--max-px", type=int, default=1 << 20, help="skip textures larger than this many pixels (1024x1024 by default)")
     ap.add_argument("--cache", default=os.path.join(ROOT, "work", "realesrgan", "cache"))
     a = ap.parse_args()
