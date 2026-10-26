@@ -123,12 +123,13 @@
   /* fullscreen: the stage fills the screen and the game letterboxes itself inside the canvas */
   #stage:fullscreen { width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; box-shadow: none; }
   #stage:-webkit-full-screen { width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; }
-  #fs { position: absolute; right: 12px; bottom: 12px; z-index: 2; width: 40px; height: 40px; display: grid; place-items: center;
+  #fs, #cam { position: absolute; right: 12px; bottom: 12px; z-index: 2; width: 40px; height: 40px; display: grid; place-items: center;
     padding: 0; border: 1px solid rgba(255, 255, 255, .18); border-radius: 10px; background: rgba(0, 0, 0, .55); color: #fff;
     backdrop-filter: blur(4px); opacity: 0; transition: opacity .25s ease; }
-  #fs svg { width: 20px; height: 20px; }
-  #stage.awake #fs, #fs:focus-visible { opacity: 1; }
-  #fs:hover { background: rgba(0, 0, 0, .75); }
+  #cam { right: 60px; }
+  #fs svg, #cam svg { width: 20px; height: 20px; }
+  #stage.awake #fs, #fs:focus-visible, #stage.awake #cam, #cam:focus-visible { opacity: 1; }
+  #fs:hover, #cam:hover { background: rgba(0, 0, 0, .75); }
   #fstip { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 2; padding: 6px 14px; border-radius: 99px;
     background: rgba(0, 0, 0, .65); color: #fff; font-size: 13px; pointer-events: none; transition: opacity .4s ease; }
   kbd { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 6px; border-radius: 5px;
@@ -182,6 +183,10 @@
   <div id="stage">
     <canvas id="canvas" width="1024" height="768" tabindex="0"></canvas>
     <div id="netstatus" class="hidden"></div>
+    <button id="cam" title="Change camera (Home, or fn + Left on a Mac)" aria-label="Change camera">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="2.5" y="7" width="13" height="10" rx="2"/><path d="M15.5 11l6-3.5v9l-6-3.5"/></svg>
+    </button>
     <button id="fs" title="Fullscreen (Alt+Enter)" aria-label="Toggle fullscreen">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path id="fs-icon" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
@@ -349,6 +354,7 @@
     <div class="row"><span class="label">Brake bias (F / R)</span><div class="keys"><kbd>[</kbd><kbd>]</kbd></div></div>
     <h3>Camera and session</h3>
     <div class="row"><span class="label">Look left / right</span><div class="keys"><kbd>V</kbd><kbd>N</kbd></div></div>
+    <div class="row"><span class="label">Change camera</span><div class="keys"><kbd>Home</kbd></div></div>
     <div class="row"><span class="label">Look behind</span><div class="keys"><kbd>B</kbd></div></div>
     <div class="row"><span class="label">Instant replay</span><div class="keys"><kbd>R</kbd></div></div>
     <div class="row"><span class="label">Restart race</span><div class="keys"><kbd>Y</kbd></div></div>

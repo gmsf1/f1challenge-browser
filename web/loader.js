@@ -543,6 +543,12 @@ function setupFullscreen() {
     else (stage.requestFullscreen || stage.webkitRequestFullscreen).call(stage)?.catch?.(() => {});
     $('canvas').focus();
   };
+  // the game cycles its camera on Home (fn + Left on a Mac keyboard); the button taps that key
+  $('cam').onclick = () => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Home' }));
+    setTimeout(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'Home' })), 80);   // a tap shorter than a frame is missed
+    $('canvas').focus();
+  };
   if (!stage.requestFullscreen && !stage.webkitRequestFullscreen) { $('fs').classList.add('hidden'); return; }
   $('fs').onclick = toggle;
   const swallow = (e) => {

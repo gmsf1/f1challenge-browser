@@ -36,6 +36,15 @@
 --patch-imm 0x4ad5f7=46   # Control - TCOverride
 --patch-imm 0x4ad60a=17   # Control - Launch Control
 --patch-imm 0x4ad61d=18   # Control - Speed Limiter
+# The Difficulty presets (function 0x4adf10, one case per level) set the driving aids when the profile loads and whenever a level is
+# chosen, over the defaults above. Beginner and Novice are the levels that turn Braking Point Assistance, Spin Recovery and Pit Lane
+# Assistance on (0 = Off, 1 = Low, 2 = High); these stores leave them Off.
+--patch-imm 0x4adf78=0   # Beginner preset: Braking Point Assistance
+--patch-imm 0x4adfb4=0   # Beginner preset: Spin Recovery
+--patch-imm 0x4ae04a=0   # Beginner preset: Pit Lane Assistance
+--patch-imm 0x4ae0e6=0   # Novice preset: Braking Point Assistance
+--patch-imm 0x4ae122=0   # Novice preset: Spin Recovery
+--patch-imm 0x4ae1b8=0   # Novice preset: Pit Lane Assistance
 # The game's own control presets (function 0x4ae750) are applied at session start and replace the player's keys:
 --patch-imm 0x4ae788=205   # preset: Steer Right
 --patch-imm 0x4ae798=203   # preset: Steer Left

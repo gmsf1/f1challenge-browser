@@ -77,3 +77,4 @@ Not affiliated with or endorsed by Electronic Arts, ISI or Microsoft. All tradem
 ## Defaults compiled into the game
 The game builds its settings (driving aids, key bindings) from defaults in its code and doesn't always apply the player file in a session,
 so `host/f1c.patches` changes those defaults at translation time (`translator/x86toc.py --patch-imm/--patch-reg`; run `tools/translate_f1c.sh`, then `build_web.sh`).
+The Difficulty presets (function `0x4adf10`) overwrite the driving aids whenever the profile loads or a level is chosen, so the Beginner and Novice presets are patched too: Braking Point Assistance, Spin Recovery and Pit Lane Assistance start Off.
